@@ -5,6 +5,8 @@ import psycopg
 from psycopg.errors import UniqueViolation
 import datetime
 from decimal import Decimal
+import pandas as pd
+from matplotlib import pyplot
 
 
 def _validate_datetime(s: str) -> bool:
@@ -30,14 +32,14 @@ def init_db(conn):
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
             description TEXT            
-        );            
-""")
+        );
+        """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS instruments (
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL UNIQUE
-        );                    
-""")
+        );
+        """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id SERIAL PRIMARY KEY,
@@ -47,11 +49,12 @@ def init_db(conn):
                         ON DELETE RESTRICT,
             trade_time TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
             result NUMERIC,
+            initial_risk NUMERIC CHECK (initial_risk >= 0),
             description TEXT,
             emotions TEXT,
             time_in_trade NUMERIC CHECK (time_in_trade >= 0)
-        );  
-""")
+        );
+        """)
         conn.commit()
 
 
@@ -62,9 +65,9 @@ def new_strategy(conn):
     with conn.cursor() as cur:
         try:
             cur.execute(
-            "INSERT INTO strategies(name, description) VALUES (%s, %s)",
-            (strategy_name, desc)
-        )
+                "INSERT INTO strategies(name, description) VALUES (%s, %s)",
+                (strategy_name, desc)
+            )
             conn.commit()
             print(f'Strategy {strategy_name} added.')
         except UniqueViolation:
@@ -102,9 +105,7 @@ def delete_strategy(conn):
 
 def print_strategies(conn):
     with conn.cursor() as cur:
-        cur.execute("""
-        SELECT * from strategies;                    
-""")
+        cur.execute("SELECT * from strategies;")
         rows = cur.fetchall()
         for row in rows:
             print(row)
@@ -113,12 +114,12 @@ def print_strategies(conn):
 def insert(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT id, name FROM strategies;")
-        rows = cur.fetchall()
+        strategies = cur.fetchall()
 
         cur.execute("SELECT id, name FROM instruments;")
         instruments = cur.fetchall()
 
-    if not rows:
+    if not strategies:
         print('First add your strategy.')
         return
     
@@ -126,13 +127,15 @@ def insert(conn):
         print('First add instruments.')
         return
 
-    choices = [Choice(title=name_, value=id_) for id_, name_ in rows]
-    strategy = questionary.select("Choose strategy: ", 
-                choices=choices).ask()
+    strategy = questionary.select(
+        "Choose strategy: ",
+        choices=[Choice(title=name, value=id_) for id_, name in strategies]
+    ).ask()
 
-    instrument_choices = [Choice(title=name_, value=id_) for id_, name_ in instruments]
-    instrument = questionary.select("Choose instrument: ",
-                choices=instrument_choices).ask()
+    instrument = questionary.select(
+        "Choose instrument: ",
+        choices=[Choice(title=name, value=id_) for id_, name in instruments]
+    ).ask()
     
     date_str = questionary.text(
         "Enter trade time (YYYY-MM-DD HH:MM):",
@@ -152,9 +155,22 @@ def insert(conn):
         return
     result = Decimal(result_str)
 
-    description = questionary.text("Why did you enter this trade? Were there any events today?").ask()
+    initial_risk_str = questionary.text(
+        "Enter initial risk (amount you risked):",
+        validate=lambda x: True if _validate_numeric(x) else "Must be a number"
+    ).ask()
+    if initial_risk_str is None:
+        print("Cancelled.")
+        return
+    initial_risk = Decimal(initial_risk_str)
 
-    emotions = questionary.text("How did you feel when taking, during and after closing the trade?").ask()
+    description = questionary.text(
+        "Why did you enter this trade? Were there any events today?"
+    ).ask()
+
+    emotions = questionary.text(
+        "How did you feel when entering, during, and after closing the trade?"
+    ).ask()
 
     time_str = questionary.text(
         "Enter time in trade (minutes):",
@@ -168,11 +184,15 @@ def insert(conn):
     with conn.cursor() as cur:
         cur.execute("""
         INSERT INTO trades (
-            strategy_id, instrument_id, trade_time, result,
+            strategy_id, instrument_id, trade_time,
+            result, initial_risk,
             description, emotions, time_in_trade
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s);
-        """, (strategy, instrument, trade_time, result, 
-              description, emotions, time_in_trade))
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+        """, (
+            strategy, instrument, trade_time,
+            result, initial_risk,
+            description, emotions, time_in_trade
+        ))
         conn.commit()
         print("Trade added successfully.")
 
@@ -183,7 +203,7 @@ def insert_instrument(conn):
     with conn.cursor() as cur:
         try:
             cur.execute(
-                "INSERT INTO instruments (name) VALUES (%s);", (instrument, )
+                "INSERT INTO instruments (name) VALUES (%s);", (instrument,)
             )
             conn.commit()
             print('Instrument added successfully!')
@@ -204,29 +224,33 @@ def delete_instrument(conn):
         print('There are no instruments.')
         return
     
-    choices = [Choice(title=name_, value=id_) for id_, name_ in instruments]
-    to_delete = questionary.select("Select instrument to delete:", choices=choices).ask()
+    to_delete = questionary.select(
+        "Select instrument to delete:",
+        choices=[Choice(title=name, value=id_) for id_, name in instruments]
+    ).ask()
     
     with conn.cursor() as cur:
-        cur.execute("DELETE from instruments WHERE id = %s", (to_delete, ))
+        cur.execute("DELETE FROM instruments WHERE id = %s", (to_delete,))
         conn.commit()
         print('Instrument deleted successfully.')
 
 
 def modify(conn):
-    to_delete_id_str = questionary.text("Enter trade id you want to modify").ask()
+    id_str = questionary.text("Enter trade id you want to modify:").ask()
     try:
-        trade_id = int(to_delete_id_str)
+        trade_id = int(id_str)
     except ValueError:
         print('You should enter a number.')
         return
     
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT strategy_id, instrument_id, trade_time, result,
-            description, emotions, time_in_trade FROM trades
+            SELECT strategy_id, instrument_id, trade_time,
+                   result, initial_risk,
+                   description, emotions, time_in_trade
+            FROM trades
             WHERE id = %s
-        """, (trade_id, ))
+        """, (trade_id,))
         row = cur.fetchone()
     
     if row is None:
@@ -234,8 +258,9 @@ def modify(conn):
         return
     
     (curr_strat, curr_instr, curr_time,
-     curr_result, curr_desc, curr_emot, curr_dur) = row
-    
+     curr_result, curr_initial,
+     curr_desc, curr_emot, curr_dur) = row
+
     with conn.cursor() as cur:
         cur.execute("SELECT id, name FROM strategies;")
         strategies = cur.fetchall()
@@ -278,6 +303,16 @@ def modify(conn):
         return
     new_result = Decimal(new_result_str) if new_result_str else None
 
+    new_initial_str = questionary.text(
+        "Enter new initial risk:",
+        default=str(curr_initial) if curr_initial is not None else "",
+        validate=lambda x: True if _validate_numeric(x) else "Must be a number"
+    ).ask()
+    if new_initial_str is None:
+        print("Cancelled.")
+        return
+    new_initial = Decimal(new_initial_str) if new_initial_str else None
+
     new_desc = questionary.text(
         "Enter new description:",
         default=curr_desc or ""
@@ -310,13 +345,14 @@ def modify(conn):
                 instrument_id = %s,
                 trade_time    = %s,
                 result        = %s,
+                initial_risk  = %s,
                 description   = %s,
                 emotions      = %s,
                 time_in_trade = %s
             WHERE id = %s;
         """, (
             strategy_id, instrument_id, new_time,
-            new_result, new_desc, new_emot, new_dur,
+            new_result, new_initial, new_desc, new_emot, new_dur,
             trade_id
         ))
     conn.commit()
@@ -324,15 +360,15 @@ def modify(conn):
 
 
 def delete(conn):
-    to_delete_id_str = questionary.text("Enter trade id you want to be deleted: ").ask()
+    id_str = questionary.text("Enter trade id you want to delete: ").ask()
     try:
-        delete_id = int(to_delete_id_str)
+        delete_id = int(id_str)
     except ValueError:
         print('You should enter a number.')
         return
     
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM trades WHERE id = %s", (delete_id, ))
+        cur.execute("DELETE FROM trades WHERE id = %s", (delete_id,))
         conn.commit()
         print(f'Trade with id {delete_id} was deleted')
 
@@ -346,37 +382,126 @@ def history(conn):
         print('There are no strategies.')
         return
     
-    strategies_choices = [Choice(title=name_, value=id_) for id_, name_ in strategies]
-    strategy = questionary.select("Choose strategy to display history", 
-                                  choices=strategies_choices).ask()
+    strategy = questionary.select(
+        "Choose strategy to display history",
+        choices=[Choice(title=name, value=id_) for id_, name in strategies]
+    ).ask()
     
     with conn.cursor() as cur:
         cur.execute("""
         SELECT * FROM trades t
         JOIN strategies s ON t.strategy_id = s.id
         WHERE t.strategy_id = %s;
-""", (strategy, ))
+        """, (strategy,))
         trade_history = cur.fetchall()
 
     for trade in trade_history:
         print(trade)
 
 
+# statistics functions
+def calculate_win_rate(series):
+    wins = (series >= 0).sum()
+    return wins / len(series)
+
+
+def average_time_in_trade(series):
+    return series.mean()
+
+
+def calc_profit(series):
+    return series.sum()
+
+
+def show_stats(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, name FROM strategies")
+        strategies = cur.fetchall()
+        cur.execute("SELECT id, name FROM instruments")
+        instruments = cur.fetchall()
+    
+    if not strategies or not instruments:
+        print('There are no strategies or instruments in database')
+        return
+    
+    strategy_choices = [Choice(value=id_, title=name_) for id_, name_ in strategies]
+    strategy_choices.append(Choice(value=None, title='all'))
+    strategy_id = questionary.select('Choose strategy: ', choices=strategy_choices).ask()
+    
+    instrument_choices = [Choice(value=id_, title=name_) for id_, name_ in instruments]
+    instrument_choices.append(Choice(value=None, title='all'))
+    instrument_id = questionary.select('Choose instrument: ', choices=instrument_choices).ask()
+
+    sql = "SELECT * FROM trades"
+    params = []
+    if strategy_id != 'all':
+        sql += " WHERE strategy_id = %s"
+        params.append(strategy_id)
+    if instrument_id != 'all':
+        prefix = " AND" if params else " WHERE"
+        sql += f"{prefix} instrument_id = %s"
+        params.append(instrument_id)
+
+    with conn.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+        col_names = [desc[0] for desc in cur.description]
+
+    if not rows:
+        print("No records meet this criteria.")
+        return
+    
+    df = pd.DataFrame(rows, columns=col_names)
+    
+    win_rate = round(calculate_win_rate(df['result']) * 100, 2)
+    average_trade_time = round(average_time_in_trade(df['time_in_trade']), 2)
+    profit = round(calc_profit(df['result']), 2)
+    avg_initial_risk = round(df['initial_risk'].mean(), 2)
+    expected_value = round(profit / len(df), 2)
+    risk_reward_ratio = round((df['result'] / df['initial_risk']).mean(), 2)
+
+    print(df.to_string())
+
+    print(f"Win-rate:               {win_rate}%")
+    print(f"Avg time in trade:      {average_trade_time} min")
+    print(f"Total P/L:              {profit}")
+    print(f"Avg initial risk:       {avg_initial_risk}")
+    print(f"Expected value/trade:   {expected_value}")
+    print(f"Avg risk-reward ratio:  {risk_reward_ratio}\n") 
+
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Financial markets strategy statistics collector")
-    parser.add_argument('operation', 
-                        choices=['insert', 'modify', 'delete', 'history', 
-                                 'quit', 'insert-strategy', 'init-db', 'print-strategies',
-                                 'delete-strategy', 'insert-instrument', 'delete-instrument'],
-                        help='Operation to choose')
+    parser = argparse.ArgumentParser(
+        description="Financial markets strategy statistics collector"
+    )
+    parser.add_argument(
+        'operation', 
+        choices=[
+            'insert', 'modify', 'delete', 'history', 'quit',
+            'insert-strategy', 'init-db', 'print-strategies', 'delete-strategy',
+            'insert-instrument', 'delete-instrument', 'show-stats'
+        ],
+        help='Operation to choose'
+    )
     args = parser.parse_args()
-    conn = psycopg.connect(dbname="strategystats", user="postgres",
-                           password="toor", port=5432, host='127.0.0.1')
+    conn = psycopg.connect(
+        dbname="strategystats",
+        user="postgres",
+        password="toor",
+        port=5432,
+        host='127.0.0.1'
+    )
     
     if args.operation == 'insert':
         insert(conn)
     elif args.operation == 'modify':
         modify(conn)
+    elif args.operation == 'delete':
+        delete(conn)
+    elif args.operation == 'history':
+        history(conn)
+    elif args.operation == 'show-stats':
+        show_stats(conn)
     elif args.operation == 'insert-strategy':
         new_strategy(conn)
     elif args.operation == 'print-strategies':
@@ -387,10 +512,6 @@ if __name__ == '__main__':
         insert_instrument(conn)
     elif args.operation == 'delete-instrument':
         delete_instrument(conn)
-    elif args.operation == 'delete':
-        delete(conn)
-    elif args.operation == 'history':
-        history(conn)
     elif args.operation == 'init-db':
         init_db(conn)
         print('Database initiated!')
@@ -398,4 +519,3 @@ if __name__ == '__main__':
         print('Goodbye!')
     
     conn.close()
-
